@@ -798,70 +798,72 @@ class VMwareVMOps(object):
         if new_size is not None:
             vi.ii.file_size = new_size
 
-    def _get_vm_template_for_image(self, context, instance, image_info, extra_specs):
-        if not instance.image_ref:
-            return None
-        else:
-            templ_instance = copy.deepcopy(instance)
-            # Use image UUID instead of instance UUID for creating the VM template.
-            templ_instance.uuid = templ_instance.image_ref
+    def _create_image_template(self, context, vi, extra_specs, metadata):
+        metadata = self._get_instance_metadata(context, vi.instance)
 
-            with lockutils.lock(templ_instance.uuid,
-                                lock_file_prefix='nova-vmware-image-template'):
+        try:
+            templ_vm_ref = self.build_virtual_machine(vi.instance,
+                                                context,
+                                                vi.ii,
+                                                vi.dc_info,
+                                                vi.datastore,
+                                                None,
+                                                extra_specs,
+                                                metadata,
+                                                folder_type='Templates')
 
-                # Create template with the smallest root disk size that can hold the image so that
-                # it can be extended during instantiation (after clone) to match the flavor
-                templ_instance.flavor.root_gb = int(math.ceil(
-                    float(image_info.file_size) / units.Gi / templ_instance.flavor.root_gb
-                ))
+            self._imagecache.enlist_image(
+                    image_info.image_id, vi.datastore, vi.dc_info.ref)
+            self._fetch_image_if_missing(context, vi)
 
-                vi = self._get_vm_config_info(templ_instance, image_info, extra_specs)
+            if image_info.is_iso:
+                self._use_iso_image(templ_vm_ref, vi)
+            elif image_info.linked_clone:
+                self._use_disk_image_as_linked_clone(templ_vm_ref, vi)
+            else:
+                self._use_disk_image_as_full_clone(templ_vm_ref, vi)
 
-                ds_vm_folder = templ_instance.uuid
-                ds_vmtx_name = "%s.vmtx" % templ_instance.uuid
-                ds_path = str(vi.datastore.build_path(ds_vm_folder, ds_vmtx_name))
-
-                templ_vm_ref = vm_util.get_vm_ref_from_ds_path(self._session, vi.dc_info.ref, ds_path)
-
-                if not templ_vm_ref:
-                    metadata = self._get_instance_metadata(context, templ_instance)
-
-                    try:
-                        templ_vm_ref = self.build_virtual_machine(templ_instance,
-                                                            context,
-                                                            image_info,
-                                                            vi.dc_info,
-                                                            vi.datastore,
-                                                            None,
-                                                            extra_specs,
-                                                            metadata,
-                                                            folder_type='Templates')
-
-                        self._imagecache.enlist_image(
-                                image_info.image_id, vi.datastore, vi.dc_info.ref)
-                        self._fetch_image_if_missing(context, vi)
-
-                        if image_info.is_iso:
-                            self._use_iso_image(templ_vm_ref, vi)
-                        elif image_info.linked_clone:
-                            self._use_disk_image_as_linked_clone(templ_vm_ref, vi)
-                        else:
-                            self._use_disk_image_as_full_clone(templ_vm_ref, vi)
-
-                        vm_util.mark_vm_as_template(self._session, templ_instance, templ_vm_ref)
-                    except Exception as create_templ_exc:
-                        with excutils.save_and_reraise_exception():
-                            LOG.error('Creating VM template for image failed with error: %s',
-                                      create_templ_exc, instance=instance)
-                            if templ_vm_ref:
-                                try:
-                                    vm_util.destroy_vm(self._session, templ_instance, templ_vm_ref)
-                                except Exception as destroy_templ_exc:
-                                    LOG.error('Cleaning up VM template for image failed with error: %s',
-                                              destroy_templ_exc, instance=instance)
-
+            vm_util.mark_vm_as_template(self._session, templ_instance, templ_vm_ref)
 
             return templ_vm_ref
+        except Exception as create_templ_exc:
+            with excutils.save_and_reraise_exception():
+                LOG.error('Creating VM template for image failed with error: %s',
+                          create_templ_exc, instance=instance)
+                if templ_vm_ref:
+                    try:
+                        vm_util.destroy_vm(self._session, templ_instance, templ_vm_ref)
+                    except Exception as destroy_templ_exc:
+                        LOG.error('Cleaning up VM template for image failed with error: %s',
+                                  destroy_templ_exc, instance=instance)
+
+
+    def _get_vm_template_for_image(self, context, instance, image_info, extra_specs):
+        templ_instance = copy.deepcopy(instance)
+        # Use image UUID instead of instance UUID for creating the VM template.
+        templ_instance.uuid = templ_instance.image_ref
+
+        with lockutils.lock(templ_instance.uuid,
+                            lock_file_prefix='nova-vmware-image-template'):
+
+            # Create template with the smallest root disk size that can hold the image so that
+            # it can be extended during instantiation (after clone) to match the flavor
+            templ_instance.flavor.root_gb = int(math.ceil(
+                float(image_info.file_size) / units.Gi / templ_instance.flavor.root_gb
+            ))
+
+            vi = self._get_vm_config_info(templ_instance, image_info, extra_specs)
+
+            ds_vm_folder = templ_instance.uuid
+            ds_vmtx_name = "%s.vmtx" % templ_instance.uuid
+            ds_path = str(vi.datastore.build_path(ds_vm_folder, ds_vmtx_name))
+
+            templ_vm_ref = vm_util.get_vm_ref_from_ds_path(self._session, vi.dc_info.ref, ds_path)
+
+            if not templ_vm_ref:
+                templ_vm_ref = self._create_image_template(context, vi, extra_specs, metadata)
+
+        return templ_vm_ref
 
     def _create_instance_from_image_template(self, context, client_factory, templ_vm_ref, vi,
                                              extra_specs, network_info):
@@ -910,8 +912,8 @@ class VMwareVMOps(object):
 
         vi = self._get_vm_config_info(instance, image_info, extra_specs)
 
-        templ_vm_ref = self._get_vm_template_for_image(context, instance, image_info, extra_specs)
-        if templ_vm_ref:
+        if instance.image_ref:
+            templ_vm_ref = self._get_vm_template_for_image(context, instance, image_info, extra_specs)
             vm_ref = self._create_instance_from_image_template(context, client_factory, templ_vm_ref, vi,
                                                                extra_specs, network_info)
         else:
