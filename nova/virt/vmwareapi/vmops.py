@@ -23,6 +23,8 @@ import collections
 import os
 import time
 import re
+import copy
+import math
 
 import decorator
 import cluster_util
@@ -295,8 +297,8 @@ class VMwareVMOps(object):
         folder_path = 'OpenStack/%s/%s' % (folder_name, type_)
         return self._create_folders(dc_info.vmFolder, folder_path)
 
-    def build_virtual_machine(self, instance, context, image_info,
-                              dc_info, datastore, network_info, extra_specs,
+    def _get_vm_config_spec(self, instance, image_info,
+                              datastore, network_info, extra_specs,
                               metadata):
         vif_infos = vmwarevif.get_vif_info(self._session,
                                            self._cluster,
@@ -320,13 +322,15 @@ class VMwareVMOps(object):
                                                  profile_spec=profile_spec,
                                                  metadata=metadata)
 
-        folder = self._get_project_folder(dc_info, project_id=instance.project_id, type_='Instances')
+        return config_spec
 
-        folder_name = self._get_folder_name('Project',
-                                            instance.project_id)
-        #folder_path = 'OpenStack/%s/Instances' % folder_name
-        #folder = self._create_folders(dc_info.vmFolder, folder_path)
-        folder = self._get_project_folder(dc_info, project_id=instance.project_id, type_='Instances')
+    def build_virtual_machine(self, instance, context, image_info,
+                              dc_info, datastore, network_info, extra_specs,
+                              metadata, folder_type='Instances'):
+        config_spec = self._get_vm_config_spec(instance, image_info, datastore,
+                                               network_info, extra_specs, metadata)
+
+        folder = self._get_project_folder(dc_info, project_id=instance.project_id, type_=folder_type)
 
         # Create the VM
         vm_ref = vm_util.create_vm(self._session, instance, folder,
@@ -794,30 +798,132 @@ class VMwareVMOps(object):
         if new_size is not None:
             vi.ii.file_size = new_size
 
+    def _get_vm_template_for_image(self, context, instance, image_info, extra_specs):
+        if not instance.image_ref:
+            return None
+        else:
+            templ_instance = copy.deepcopy(instance)
+            # Use image UUID instead of instance UUID for creating the VM template.
+            templ_instance.uuid = templ_instance.image_ref
+
+            with lockutils.lock(templ_instance.uuid,
+                                lock_file_prefix='nova-vmware-image-template'):
+
+                # Create template with the smallest root disk size that can hold the image so that
+                # it can be extended during instantiation (after clone) to match the flavor
+                templ_instance.flavor.root_gb = int(math.ceil(
+                    float(image_info.file_size) / units.Gi / templ_instance.flavor.root_gb
+                ))
+
+                vi = self._get_vm_config_info(templ_instance, image_info, extra_specs)
+
+                ds_vm_folder = templ_instance.uuid
+                ds_vmtx_name = "%s.vmtx" % templ_instance.uuid
+                ds_path = str(vi.datastore.build_path(ds_vm_folder, ds_vmtx_name))
+
+                templ_vm_ref = vm_util.get_vm_ref_from_ds_path(self._session, vi.dc_info.ref, ds_path)
+
+                if not templ_vm_ref:
+                    metadata = self._get_instance_metadata(context, templ_instance)
+
+                    try:
+                        templ_vm_ref = self.build_virtual_machine(templ_instance,
+                                                            context,
+                                                            image_info,
+                                                            vi.dc_info,
+                                                            vi.datastore,
+                                                            None,
+                                                            extra_specs,
+                                                            metadata,
+                                                            folder_type='Templates')
+
+                        self._imagecache.enlist_image(
+                                image_info.image_id, vi.datastore, vi.dc_info.ref)
+                        self._fetch_image_if_missing(context, vi)
+
+                        if image_info.is_iso:
+                            self._use_iso_image(templ_vm_ref, vi)
+                        elif image_info.linked_clone:
+                            self._use_disk_image_as_linked_clone(templ_vm_ref, vi)
+                        else:
+                            self._use_disk_image_as_full_clone(templ_vm_ref, vi)
+
+                        vm_util.mark_vm_as_template(self._session, templ_instance, templ_vm_ref)
+                    except Exception as create_templ_exc:
+                        with excutils.save_and_reraise_exception():
+                            LOG.error('Creating VM template for image failed with error: %s',
+                                      create_templ_exc, instance=instance)
+                            if templ_vm_ref:
+                                try:
+                                    vm_util.destroy_vm(self._session, templ_instance, templ_vm_ref)
+                                except Exception as destroy_templ_exc:
+                                    LOG.error('Cleaning up VM template for image failed with error: %s',
+                                              destroy_templ_exc, instance=instance)
+
+
+            return templ_vm_ref
+
+    def _create_instance_from_image_template(self, context, client_factory, templ_vm_ref, vi,
+                                             extra_specs, network_info):
+        rel_spec = vm_util.relocate_vm_spec(client_factory,
+                                            res_pool=self._root_resource_pool,
+                                            disk_move_type="moveAllDiskBackingsAndDisallowSharing")
+        clone_spec = vm_util.clone_vm_spec(client_factory, rel_spec)
+        vm_clone_task = self._session._call_method(
+            self._session.vim,
+            "CloneVM_Task",
+            templ_vm_ref,
+            folder=self._get_project_folder(vi.dc_info, project_id=vi.instance.project_id, type_='Instances'),
+            name=vi.instance.uuid,
+            spec=clone_spec)
+        task_info = self._session._wait_for_task(vm_clone_task)
+        vm_ref = task_info.result
+
+        root_vmdk_info = vm_util.get_vmdk_info(self._session, vm_ref, uuid=vi.instance.uuid)
+        self._extend_if_required(vi.dc_info, vi.ii, vi.instance, root_vmdk_info.path)
+
+        metadata = self._get_instance_metadata(context, vi.instance)
+        reconfig_spec = vm_util.get_vm_resize_spec(client_factory,
+                                                   int(vi.instance.vcpus), int(vi.instance.memory_mb),
+                                                   extra_specs, metadata=metadata)
+        reconfig_spec.instanceUuid = vi.instance.uuid
+        vif_infos = vmwarevif.get_vif_info(self._session,
+                                           self._cluster,
+                                           utils.is_neutron(),
+                                           vi.ii.vif_model,
+                                           network_info)
+        vm_util.append_vif_infos_to_config_spec(client_factory, reconfig_spec, vif_infos, extra_specs.vif_limits)
+
+        vm_util.reconfigure_vm(self._session, vm_ref, reconfig_spec)
+
+        return vm_ref
+
     def spawn(self, context, instance, image_meta, injected_files,
               admin_password, network_info, block_device_info=None):
-
         client_factory = self._session.vim.client.factory
+
         image_info = images.VMwareImage.from_image(context,
                                                    instance.image_ref,
                                                    image_meta)
 
         extra_specs = self._get_extra_specs(instance.flavor, image_meta)
 
-        vi = self._get_vm_config_info(instance, image_info,
-                                      extra_specs)
+        vi = self._get_vm_config_info(instance, image_info, extra_specs)
 
-        metadata = self._get_instance_metadata(context, instance)
-        # Creates the virtual machine. The virtual machine reference returned
-        # is unique within Virtual Center.
-        vm_ref = self.build_virtual_machine(instance,
-                                            context,
-                                            image_info,
-                                            vi.dc_info,
-                                            vi.datastore,
-                                            network_info,
-                                            extra_specs,
-                                            metadata)
+        templ_vm_ref = self._get_vm_template_for_image(context, instance, image_info, extra_specs)
+        if templ_vm_ref:
+            vm_ref = self._create_instance_from_image_template(context, client_factory, templ_vm_ref, vi,
+                                                               extra_specs, network_info)
+        else:
+            metadata = self._get_instance_metadata(context, instance)
+            vm_ref = self.build_virtual_machine(instance,
+                                                context,
+                                                image_info,
+                                                vi.dc_info,
+                                                vi.datastore,
+                                                network_info,
+                                                extra_specs,
+                                                metadata)
 
         # Cache the vm_ref. This saves a remote call to the VC. This uses the
         # instance uuid.
@@ -840,18 +946,6 @@ class VMwareVMOps(object):
         if block_device_info is not None:
             block_device_mapping = driver.block_device_info_get_mapping(
                 block_device_info)
-
-        if instance.image_ref:
-            self._imagecache.enlist_image(
-                    image_info.image_id, vi.datastore, vi.dc_info.ref)
-            self._fetch_image_if_missing(context, vi)
-
-            if image_info.is_iso:
-                self._use_iso_image(vm_ref, vi)
-            elif image_info.linked_clone:
-                self._use_disk_image_as_linked_clone(vm_ref, vi)
-            else:
-                self._use_disk_image_as_full_clone(vm_ref, vi)
 
         if block_device_mapping:
             msg = "Block device information present: %s" % block_device_info

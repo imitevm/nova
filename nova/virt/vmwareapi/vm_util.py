@@ -196,6 +196,22 @@ def _get_allocation_info(client_factory, limits, allocation_type):
         allocation.shares = shares
     return allocation
 
+def append_vif_infos_to_config_spec(client_factory, config_spec, vif_infos, vif_limits):
+    if not config_spec.deviceChange:
+        config_spec.deviceChange = []
+    for vif_info in vif_infos:
+        vif_spec = _create_vif_spec(client_factory, vif_info, vif_limits)
+        config_spec.deviceChange.append(vif_spec)
+
+    if not config_spec.extraConfig:
+        config_spec.extraConfig = []
+    port_index = 0
+    for vif_info in vif_infos:
+        if vif_info['iface_id']:
+            config_spec.extraConfig.append(_iface_id_option_value(client_factory,
+                                                                  vif_info['iface_id'],
+                                                                  port_index))
+            port_index += 1
 
 def get_vm_create_spec(client_factory, instance, data_store_name,
                        vif_infos, extra_specs,
@@ -253,11 +269,6 @@ def get_vm_create_spec(client_factory, instance, data_store_name,
         config_spec.firmware = extra_specs.firmware
 
     devices = []
-    for vif_info in vif_infos:
-        vif_spec = _create_vif_spec(client_factory, vif_info,
-                                    extra_specs.vif_limits)
-        devices.append(vif_spec)
-
     serial_port_spec = create_serial_port_spec(client_factory)
     if serial_port_spec:
         devices.append(serial_port_spec)
@@ -281,14 +292,6 @@ def get_vm_create_spec(client_factory, instance, data_store_name,
     opt.value = True
     extra_config.append(opt)
 
-    port_index = 0
-    for vif_info in vif_infos:
-        if vif_info['iface_id']:
-            extra_config.append(_iface_id_option_value(client_factory,
-                                                       vif_info['iface_id'],
-                                                       port_index))
-            port_index += 1
-
     if (CONF.vmware.console_delay_seconds and
         CONF.vmware.console_delay_seconds > 0):
         opt = client_factory.create('ns0:OptionValue')
@@ -297,6 +300,8 @@ def get_vm_create_spec(client_factory, instance, data_store_name,
         extra_config.append(opt)
 
     config_spec.extraConfig = extra_config
+
+    append_vif_infos_to_config_spec(client_factory, config_spec, vif_infos, extra_specs.vif_limits)
 
     # Set the VM to be 'managed' by 'OpenStack'
     managed_by = client_factory.create('ns0:ManagedByInfo')
@@ -508,12 +513,9 @@ def get_network_attach_config_spec(client_factory, vif_info, index,
                                    vif_limits=None):
     """Builds the vif attach config spec."""
     config_spec = client_factory.create('ns0:VirtualMachineConfigSpec')
-    vif_spec = _create_vif_spec(client_factory, vif_info, vif_limits)
-    config_spec.deviceChange = [vif_spec]
-    if vif_info['iface_id'] is not None:
-        config_spec.extraConfig = [_iface_id_option_value(client_factory,
-                                                          vif_info['iface_id'],
-                                                          index)]
+
+    append_vif_infos_to_config_spec(client_factory, config_spec, [vif_info], vif_limits)
+
     return config_spec
 
 
@@ -1122,6 +1124,15 @@ def _get_vm_ref_from_vm_uuid(session, instance_uuid):
         return vm_refs[0]
 
 
+def get_vm_ref_from_ds_path(session, dc_ref, ds_path):
+    return session._call_method(
+        session.vim,
+        "FindByDatastorePath",
+        session.vim.service_content.searchIndex,
+        datacenter=dc_ref,
+        path=ds_path)
+
+
 def _get_vm_ref_from_extraconfig(session, instance_uuid):
     """Get reference to the VM with the uuid specified."""
     vms = session._call_method(vim_util, "get_objects",
@@ -1393,6 +1404,20 @@ def destroy_vm(session, instance, vm_ref=None):
         LOG.info("Destroyed the VM", instance=instance)
     except Exception:
         LOG.exception(_('Destroy VM failed'), instance=instance)
+
+
+def mark_vm_as_template(session, instance, vm_ref=None):
+    """Mark a VM instance as template. Assumes VM is powered off."""
+    try:
+        if not vm_ref:
+            vm_ref = get_vm_ref(session, instance)
+        LOG.debug("Marking the VM as template", instance=instance)
+        task = session._call_method(session.vim, "MarkAsTemplate",
+                                            vm_ref)
+        session._wait_for_task(task)
+        LOG.info("Marked the VM as template", instance=instance)
+    except Exception:
+        LOG.exception(_('Mark VM as template failed'), instance=instance)
 
 
 def create_virtual_disk(session, dc_ref, adapter_type, disk_type,
