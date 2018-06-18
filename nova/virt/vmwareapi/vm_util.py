@@ -1412,9 +1412,7 @@ def mark_vm_as_template(session, instance, vm_ref=None):
         if not vm_ref:
             vm_ref = get_vm_ref(session, instance)
         LOG.debug("Marking the VM as template", instance=instance)
-        task = session._call_method(session.vim, "MarkAsTemplate",
-                                            vm_ref)
-        session._wait_for_task(task)
+        session._call_method(session.vim, "MarkAsTemplate", vm_ref)
         LOG.info("Marked the VM as template", instance=instance)
     except Exception:
         LOG.exception(_('Mark VM as template failed'), instance=instance)

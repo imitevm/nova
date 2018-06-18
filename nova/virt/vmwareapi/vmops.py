@@ -798,7 +798,7 @@ class VMwareVMOps(object):
         if new_size is not None:
             vi.ii.file_size = new_size
 
-    def _create_image_template(self, context, vi, extra_specs, metadata):
+    def _create_image_template(self, context, vi, extra_specs):
         metadata = self._get_instance_metadata(context, vi.instance)
 
         try:
@@ -813,29 +813,28 @@ class VMwareVMOps(object):
                                                 folder_type='Templates')
 
             self._imagecache.enlist_image(
-                    image_info.image_id, vi.datastore, vi.dc_info.ref)
+                    vi.ii.image_id, vi.datastore, vi.dc_info.ref)
             self._fetch_image_if_missing(context, vi)
 
-            if image_info.is_iso:
+            if vi.ii.is_iso:
                 self._use_iso_image(templ_vm_ref, vi)
-            elif image_info.linked_clone:
+            elif vi.ii.linked_clone:
                 self._use_disk_image_as_linked_clone(templ_vm_ref, vi)
             else:
                 self._use_disk_image_as_full_clone(templ_vm_ref, vi)
 
-            vm_util.mark_vm_as_template(self._session, templ_instance, templ_vm_ref)
+            vm_util.mark_vm_as_template(self._session, vi.instance, templ_vm_ref)
 
             return templ_vm_ref
         except Exception as create_templ_exc:
             with excutils.save_and_reraise_exception():
                 LOG.error('Creating VM template for image failed with error: %s',
-                          create_templ_exc, instance=instance)
-                if templ_vm_ref:
-                    try:
-                        vm_util.destroy_vm(self._session, templ_instance, templ_vm_ref)
-                    except Exception as destroy_templ_exc:
-                        LOG.error('Cleaning up VM template for image failed with error: %s',
-                                  destroy_templ_exc, instance=instance)
+                          create_templ_exc, instance=vi.instance)
+                try:
+                    vm_util.destroy_vm(self._session, vi.instance)
+                except Exception as destroy_templ_exc:
+                    LOG.error('Cleaning up VM template for image failed with error: %s',
+                              destroy_templ_exc, instance=vi.instance)
 
 
     def _get_vm_template_for_image(self, context, instance, image_info, extra_specs):
@@ -861,9 +860,9 @@ class VMwareVMOps(object):
             templ_vm_ref = vm_util.get_vm_ref_from_ds_path(self._session, vi.dc_info.ref, ds_path)
 
             if not templ_vm_ref:
-                templ_vm_ref = self._create_image_template(context, vi, extra_specs, metadata)
+                templ_vm_ref = self._create_image_template(context, vi, extra_specs)
 
-        return templ_vm_ref
+            return templ_vm_ref
 
     def _create_instance_from_image_template(self, context, client_factory, templ_vm_ref, vi,
                                              extra_specs, network_info):
