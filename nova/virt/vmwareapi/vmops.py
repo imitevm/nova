@@ -292,9 +292,13 @@ class VMwareVMOps(object):
         # We cannot truncate the 'id' as this is unique across OpenStack.
         return '%s (%s)' % (name[:40], id[:36])
 
-    def _get_project_folder(self, dc_info, project_id=None, type_=None):
+    def _get_project_folder_path(self, project_id, type_):
         folder_name = self._get_folder_name('Project', project_id)
         folder_path = 'OpenStack/%s/%s' % (folder_name, type_)
+        return folder_path
+
+    def _get_project_folder(self, dc_info, project_id=None, type_=None):
+        folder_path = self._get_project_folder_path(project_id, type_)
         return self._create_folders(dc_info.vmFolder, folder_path)
 
     def _get_vm_config_spec(self, instance, image_info,
@@ -464,12 +468,16 @@ class VMwareVMOps(object):
             image_ds_loc.rel_path,
             cookies=cookies)
 
+    def _get_image_template_vm_name(self, image_id, datastore_name):
+        templ_vm_name = '%s (%s)' % (image_id, datastore_name)
+        return templ_vm_name
+
     def _fetch_image_as_vapp(self, context, vi, image_ds_loc):
         """Download stream optimized image to host as a vApp."""
 
         # The directory of the imported disk is the unique name
         # of the VM use to import it with.
-        vm_name = '%s (%s)' % (vi.ii.image_id, vi.datastore.name)
+        vm_name = self._get_image_template_vm_name(vi.ii.image_id, vi.datastore.name)
 
         LOG.debug("Downloading stream optimized image %(image_id)s to "
                   "%(vm_name)s on the data store "
@@ -485,7 +493,7 @@ class VMwareVMOps(object):
             self._session,
             vm_name,
             vi.datastore.name,
-            self._get_project_folder(vi.dc_info, project_id=vi.ii.owner, type_='Images'),
+            self._get_project_folder(vi.dc_info, project_id=vi.instance.project_id, type_='Images'),
             self._root_resource_pool)
         # The size of the image is different from the size of the virtual disk.
         # We want to use the latter. On vSAN this is the only way to get this
@@ -498,24 +506,16 @@ class VMwareVMOps(object):
 
         # The directory of the imported disk is the unique name
         # of the VM use to import it with.
-        vm_name = '%s (%s)' % (vi.ii.image_id, vi.datastore.name)
+        vm_name = self._get_image_template_vm_name(vi.ii.image_id, vi.datastore.name)
 
         image_size, src_folder_ds_path = images.fetch_image_ova(context,
                                vi.instance,
                                self._session,
                                vm_name,
                                vi.datastore.name,
-                               self._get_project_folder(vi.dc_info, project_id=vi.ii.owner,type_='Images'),
+                               self._get_project_folder(vi.dc_info, project_id=vi.instance.project_id, type_='Images'),
                                self._root_resource_pool)
 
-        self._move_to_cache(vi.dc_info.ref,
-                            src_folder_ds_path,
-                            vi.cache_image_folder)
-
-        try:
-            ds_util.mkdir(self._session, vi.cache_image_folder, vi.dc_info.ref)
-        except vexc.FileAlreadyExistsException:
-            pass
         # The size of the image is different from the size of the virtual disk.
         # We want to use the latter. On vSAN this is the only way to get this
         # size because there is no VMDK descriptor.
@@ -607,7 +607,7 @@ class VMwareVMOps(object):
             except vexc.FileAlreadyExistsException:
                 pass
             try:
-                ds_util.disk_move(self._session, vi.dc_info.ref,
+                ds_util.disk_copy(self._session, vi.dc_info.ref,
                                   tmp_image_ds_loc, dst_path)
             except vexc.FileAlreadyExistsException:
                 pass
@@ -810,7 +810,7 @@ class VMwareVMOps(object):
                                                 None,
                                                 extra_specs,
                                                 metadata,
-                                                folder_type='Templates')
+                                                folder_type='Images')
 
             self._imagecache.enlist_image(
                     vi.ii.image_id, vi.datastore, vi.dc_info.ref)
@@ -853,11 +853,15 @@ class VMwareVMOps(object):
 
             vi = self._get_vm_config_info(templ_instance, image_info, extra_specs)
 
-            ds_vm_folder = templ_instance.uuid
-            ds_vmtx_name = "%s.vmtx" % templ_instance.uuid
-            ds_path = str(vi.datastore.build_path(ds_vm_folder, ds_vmtx_name))
+            self._imagecache.enlist_image(
+                    vi.ii.image_id, vi.datastore, vi.dc_info.ref)
+            self._fetch_image_if_missing(context, vi)
 
-            templ_vm_ref = vm_util.get_vm_ref_from_ds_path(self._session, vi.dc_info.ref, ds_path)
+            images_folder_path = self._get_project_folder_path(vi.instance.project_id, 'Images')
+            templ_vm_name = self._get_image_template_vm_name(vi.ii.image_id, vi.datastore.name)
+            templ_vm_inventory_path = '%s/%s' % (images_folder_path, templ_vm_name)
+
+            templ_vm_ref = vm_util.get_vm_ref_from_inventory_path(self._session, templ_vm_inventory_path)
 
             if not templ_vm_ref:
                 templ_vm_ref = self._create_image_template(context, vi, extra_specs)

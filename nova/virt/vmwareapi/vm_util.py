@@ -1133,6 +1133,14 @@ def get_vm_ref_from_ds_path(session, dc_ref, ds_path):
         path=ds_path)
 
 
+def get_vm_ref_from_inventory_path(session, inv_path):
+    return session._call_method(
+        session.vim,
+        "FindByInventoryPath",
+        session.vim.service_content.searchIndex,
+        inventoryPath=inv_path)
+
+
 def _get_vm_ref_from_extraconfig(session, instance_uuid):
     """Get reference to the VM with the uuid specified."""
     vms = session._call_method(vim_util, "get_objects",
