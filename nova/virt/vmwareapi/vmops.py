@@ -25,6 +25,7 @@ import time
 import re
 import copy
 import math
+import six
 
 import decorator
 import cluster_util
@@ -303,7 +304,7 @@ class VMwareVMOps(object):
 
     def _get_vm_config_spec(self, instance, image_info,
                               datastore, network_info, extra_specs,
-                              metadata):
+                              metadata, vm_name=None):
         vif_infos = vmwarevif.get_vif_info(self._session,
                                            self._cluster,
                                            utils.is_neutron(),
@@ -324,15 +325,17 @@ class VMwareVMOps(object):
                                                  extra_specs,
                                                  image_info.os_type,
                                                  profile_spec=profile_spec,
-                                                 metadata=metadata)
+                                                 metadata=metadata,
+                                                 vm_name=vm_name)
 
         return config_spec
 
     def build_virtual_machine(self, instance, context, image_info,
                               dc_info, datastore, network_info, extra_specs,
-                              metadata, folder_type='Instances'):
+                              metadata, folder_type='Instances', vm_name=None):
         config_spec = self._get_vm_config_spec(instance, image_info, datastore,
-                                               network_info, extra_specs, metadata)
+                                               network_info, extra_specs, metadata,
+                                               vm_name=vm_name)
 
         folder = self._get_project_folder(dc_info, project_id=instance.project_id, type_=folder_type)
 
@@ -600,19 +603,16 @@ class VMwareVMOps(object):
                             vi.cache_image_folder)
 
     def _cache_vm_image(self, vi, tmp_image_ds_loc):
+        dst_path = vi.cache_image_folder.join("%s.vmdk" % vi.ii.image_id)
         try:
-            dst_path = vi.cache_image_folder.join("%s.vmdk" % vi.ii.image_id)
-            try:
-                ds_util.mkdir(self._session, vi.cache_image_folder, vi.dc_info.ref)
-            except vexc.FileAlreadyExistsException:
-                pass
-            try:
-                ds_util.disk_copy(self._session, vi.dc_info.ref,
-                                  tmp_image_ds_loc, dst_path)
-            except vexc.FileAlreadyExistsException:
-                pass
-        finally:
-            self._delete_datastore_file(str(ds_obj.DatastorePath.parse(tmp_image_ds_loc).parent), vi.dc_info.ref)
+            ds_util.mkdir(self._session, vi.cache_image_folder, vi.dc_info.ref)
+        except vexc.FileAlreadyExistsException:
+            pass
+        try:
+            ds_util.disk_copy(self._session, vi.dc_info.ref,
+                              tmp_image_ds_loc, dst_path)
+        except vexc.FileAlreadyExistsException:
+            pass
 
     """def _cache_stream_optimized_image(self, vi, tmp_image_ds_loc):
         dst_path = vi.cache_image_folder.join("%s.vmdk" % vi.ii.image_id)
@@ -801,41 +801,54 @@ class VMwareVMOps(object):
     def _create_image_template(self, context, vi, extra_specs):
         metadata = self._get_instance_metadata(context, vi.instance)
 
-        try:
-            templ_vm_ref = self.build_virtual_machine(vi.instance,
-                                                context,
-                                                vi.ii,
-                                                vi.dc_info,
-                                                vi.datastore,
-                                                None,
-                                                extra_specs,
-                                                metadata,
-                                                folder_type='Images')
+        max_attempts = 2
+        for i in six.moves.xrange(max_attempts):
+            try:
+                templ_vm_ref = self.build_virtual_machine(vi.instance,
+                                                    context,
+                                                    vi.ii,
+                                                    vi.dc_info,
+                                                    vi.datastore,
+                                                    None,
+                                                    extra_specs,
+                                                    metadata,
+                                                    folder_type='Images',
+                                                    vm_name=self._get_image_template_vm_name(vi.ii.image_id, vi.datastore.name))
 
-            self._imagecache.enlist_image(
-                    vi.ii.image_id, vi.datastore, vi.dc_info.ref)
-            self._fetch_image_if_missing(context, vi)
+                self._imagecache.enlist_image(
+                        vi.ii.image_id, vi.datastore, vi.dc_info.ref)
+                self._fetch_image_if_missing(context, vi)
 
-            if vi.ii.is_iso:
-                self._use_iso_image(templ_vm_ref, vi)
-            elif vi.ii.linked_clone:
-                self._use_disk_image_as_linked_clone(templ_vm_ref, vi)
-            else:
-                self._use_disk_image_as_full_clone(templ_vm_ref, vi)
+                if vi.ii.is_iso:
+                    self._use_iso_image(templ_vm_ref, vi)
+                elif vi.ii.linked_clone:
+                    self._use_disk_image_as_linked_clone(templ_vm_ref, vi)
+                else:
+                    self._use_disk_image_as_full_clone(templ_vm_ref, vi)
 
-            vm_util.mark_vm_as_template(self._session, vi.instance, templ_vm_ref)
+                vm_util.mark_vm_as_template(self._session, vi.instance, templ_vm_ref)
 
-            return templ_vm_ref
-        except Exception as create_templ_exc:
-            with excutils.save_and_reraise_exception():
-                LOG.error('Creating VM template for image failed with error: %s',
-                          create_templ_exc, instance=vi.instance)
-                try:
-                    vm_util.destroy_vm(self._session, vi.instance)
-                except Exception as destroy_templ_exc:
-                    LOG.error('Cleaning up VM template for image failed with error: %s',
-                              destroy_templ_exc, instance=vi.instance)
+                return templ_vm_ref
+            except Exception as create_templ_exc:
+                is_last_attempt = (i == max_attempts - 1)
+                with excutils.save_and_reraise_exception(reraise=is_last_attempt):
+                    LOG.error('Creating VM template for image failed with error: %s',
+                              create_templ_exc, instance=vi.instance)
+                    try:
+                        vm_util.destroy_vm(self._session, vi.instance)
+                    except Exception as destroy_templ_exc:
+                        LOG.error('Cleaning up VM template for image failed with error: %s',
+                                  destroy_templ_exc, instance=vi.instance)
 
+    def _build_template_vm_inventory_path(self, vi):
+        vm_folder_name = self._session._call_method(vutil,
+                                                    "get_object_property",
+                                                    vi.dc_info.vmFolder,
+                                                    "name")
+        images_folder_path = self._get_project_folder_path(vi.instance.project_id, 'Images')
+        templ_vm_name = self._get_image_template_vm_name(vi.ii.image_id, vi.datastore.name)
+        templ_vm_inventory_path = '%s/%s/%s/%s' % (vi.dc_info.name, vm_folder_name, images_folder_path, templ_vm_name)
+        return templ_vm_inventory_path
 
     def _get_vm_template_for_image(self, context, instance, image_info, extra_specs):
         templ_instance = copy.deepcopy(instance)
@@ -857,11 +870,8 @@ class VMwareVMOps(object):
                     vi.ii.image_id, vi.datastore, vi.dc_info.ref)
             self._fetch_image_if_missing(context, vi)
 
-            images_folder_path = self._get_project_folder_path(vi.instance.project_id, 'Images')
-            templ_vm_name = self._get_image_template_vm_name(vi.ii.image_id, vi.datastore.name)
-            templ_vm_inventory_path = '%s/%s' % (images_folder_path, templ_vm_name)
-
-            templ_vm_ref = vm_util.get_vm_ref_from_inventory_path(self._session, templ_vm_inventory_path)
+            templ_vm_inventory_path = self._build_template_vm_inventory_path(vi)
+            templ_vm_ref = vm_util.find_by_inventory_path(self._session, templ_vm_inventory_path)
 
             if not templ_vm_ref:
                 templ_vm_ref = self._create_image_template(context, vi, extra_specs)

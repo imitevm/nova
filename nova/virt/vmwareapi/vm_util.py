@@ -216,10 +216,10 @@ def append_vif_infos_to_config_spec(client_factory, config_spec, vif_infos, vif_
 def get_vm_create_spec(client_factory, instance, data_store_name,
                        vif_infos, extra_specs,
                        os_type=constants.DEFAULT_OS_TYPE,
-                       profile_spec=None, metadata=None):
+                       profile_spec=None, metadata=None, vm_name=None):
     """Builds the VM Create spec."""
     config_spec = client_factory.create('ns0:VirtualMachineConfigSpec')
-    config_spec.name = instance.uuid
+    config_spec.name = vm_name or instance.uuid
     config_spec.guestId = os_type
     # The name is the unique identifier for the VM.
     config_spec.instanceUuid = instance.uuid
@@ -1124,16 +1124,7 @@ def _get_vm_ref_from_vm_uuid(session, instance_uuid):
         return vm_refs[0]
 
 
-def get_vm_ref_from_ds_path(session, dc_ref, ds_path):
-    return session._call_method(
-        session.vim,
-        "FindByDatastorePath",
-        session.vim.service_content.searchIndex,
-        datacenter=dc_ref,
-        path=ds_path)
-
-
-def get_vm_ref_from_inventory_path(session, inv_path):
+def find_by_inventory_path(session, inv_path):
     return session._call_method(
         session.vim,
         "FindByInventoryPath",
