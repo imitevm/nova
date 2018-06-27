@@ -196,7 +196,7 @@ def _get_allocation_info(client_factory, limits, allocation_type):
         allocation.shares = shares
     return allocation
 
-def append_vif_infos_to_config_spec(client_factory, config_spec, vif_infos, vif_limits):
+def append_vif_infos_to_config_spec(client_factory, config_spec, vif_infos, vif_limits, index=0):
     if not config_spec.deviceChange:
         config_spec.deviceChange = []
     for vif_info in vif_infos:
@@ -205,7 +205,7 @@ def append_vif_infos_to_config_spec(client_factory, config_spec, vif_infos, vif_
 
     if not config_spec.extraConfig:
         config_spec.extraConfig = []
-    port_index = 0
+    port_index = index
     for vif_info in vif_infos:
         if vif_info['iface_id']:
             config_spec.extraConfig.append(_iface_id_option_value(client_factory,
@@ -514,7 +514,7 @@ def get_network_attach_config_spec(client_factory, vif_info, index,
     """Builds the vif attach config spec."""
     config_spec = client_factory.create('ns0:VirtualMachineConfigSpec')
 
-    append_vif_infos_to_config_spec(client_factory, config_spec, [vif_info], vif_limits)
+    append_vif_infos_to_config_spec(client_factory, config_spec, [vif_info], vif_limits, index)
 
     return config_spec
 
