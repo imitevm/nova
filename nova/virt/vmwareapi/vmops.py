@@ -82,6 +82,10 @@ vmops_opts = [
     cfg.BoolOpt('clone_from_snapshot',
                 default=True,
                 help='Create a snapshot of the VM before cloning it'),
+    cfg.BoolOpt('fetch_image_from_other_datastores',
+                default=True,
+                help='Before fetching from Glance an image missing on the datastore first look for it on other '
+                     'datastores and clone it from there if available.'),
     ]
 
 
@@ -687,6 +691,32 @@ class VMwareVMOps(object):
             raise exception.InvalidDiskInfo(reason=reason)
         return image_prepare, image_fetch, image_cache
 
+    def _fetch_image_from_other_datastores(self, vi):
+        dc_all_datastores = ds_util.get_available_datastores(self._session, dc_ref=vi.dc_info.ref)
+        dc_other_datastores = [ds for ds in dc_all_datastores if dict(ds.ref) != dict(vi.datastore.ref)]
+
+        client_factory = self._session.vim.client.factory
+        tmp_vi = copy.copy(vi)
+        for ds in dc_other_datastores:
+            tmp_vi.datastore = ds
+            other_templ_vm_ref = self._find_image_template_vm(tmp_vi)
+            if other_templ_vm_ref:
+                rel_spec = vm_util.relocate_vm_spec(client_factory,
+                                                    res_pool=self._root_resource_pool,
+                                                    disk_move_type="moveAllDiskBackingsAndDisallowSharing",
+                                                    datastore=vi.datastore.ref)
+                clone_spec = vm_util.clone_vm_spec(client_factory, rel_spec, template=True)
+                templ_vm_clone_task = self._session._call_method(
+                    self._session.vim,
+                    "CloneVM_Task",
+                    other_templ_vm_ref,
+                    folder=self._get_project_folder(vi.dc_info, project_id=vi.instance.project_id, type_='Images'),
+                    name=self._get_image_template_vm_name(vi.ii.image_id, vi.datastore.name),
+                    spec=clone_spec)
+                task_info = self._session._wait_for_task(templ_vm_clone_task)
+                templ_vm_ref = task_info.result
+                return templ_vm_ref
+
     def _fetch_image_if_missing(self, context, vi):
         image_prepare, image_fetch, image_cache = self._get_image_callbacks(vi)
         LOG.debug("Processing image %s", vi.ii.image_id, instance=vi.instance)
@@ -695,9 +725,13 @@ class VMwareVMOps(object):
                             lock_file_prefix='nova-vmware-fetch_image'):
             self.check_cache_folder(vi.datastore.name, vi.datastore.ref)
             ds_browser = self._get_ds_browser(vi.datastore.ref)
-            if not ds_util.file_exists(self._session, ds_browser,
-                                       vi.cache_image_folder,
-                                       vi.cache_image_path.basename):
+            image_available = ds_util.file_exists(self._session, ds_browser, vi.cache_image_folder,
+                                                  vi.cache_image_path.basename)
+            if not image_available and CONF.vmware.fetch_image_from_other_datastores:
+                templ_vm_ref = self._fetch_image_from_other_datastores(vi)
+                image_available = (templ_vm_ref is not None)
+
+            if not image_available:
                 LOG.debug("Preparing fetch location", instance=vi.instance)
                 tmp_dir_loc, tmp_image_ds_loc = image_prepare(vi)
                 LOG.debug("Fetch image to %s", tmp_image_ds_loc,
@@ -850,6 +884,12 @@ class VMwareVMOps(object):
         templ_vm_inventory_path = '%s/%s/%s/%s' % (vi.dc_info.name, vm_folder_name, images_folder_path, templ_vm_name)
         return templ_vm_inventory_path
 
+    def _find_image_template_vm(self, vi):
+        templ_vm_inventory_path = self._build_template_vm_inventory_path(vi)
+        templ_vm_ref = vm_util.find_by_inventory_path(self._session, templ_vm_inventory_path)
+
+        return templ_vm_ref
+
     def _get_vm_template_for_image(self, context, instance, image_info, extra_specs):
         templ_instance = copy.deepcopy(instance)
         # Use image UUID instead of instance UUID for creating the VM template.
@@ -870,8 +910,10 @@ class VMwareVMOps(object):
                     vi.ii.image_id, vi.datastore, vi.dc_info.ref)
             self._fetch_image_if_missing(context, vi)
 
-            templ_vm_inventory_path = self._build_template_vm_inventory_path(vi)
-            templ_vm_ref = vm_util.find_by_inventory_path(self._session, templ_vm_inventory_path)
+            templ_vm_ref = self._find_image_template_vm(vi)
+
+            if not templ_vm_ref and CONF.vmware.fetch_image_from_other_datastores:
+                templ_vm_ref = self._fetch_image_from_other_datastores(vi)
 
             if not templ_vm_ref:
                 templ_vm_ref = self._create_image_template(context, vi, extra_specs)
