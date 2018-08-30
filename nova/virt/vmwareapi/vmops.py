@@ -727,6 +727,11 @@ class VMwareVMOps(object):
             ds_browser = self._get_ds_browser(vi.datastore.ref)
             image_available = ds_util.file_exists(self._session, ds_browser, vi.cache_image_folder,
                                                   vi.cache_image_path.basename)
+
+            if not image_available:
+                templ_vm_ref = self._find_image_template_vm(vi)
+                image_available = (templ_vm_ref is not None)
+
             if not image_available and CONF.vmware.fetch_image_from_other_datastores:
                 templ_vm_ref = self._fetch_image_from_other_datastores(vi)
                 image_available = (templ_vm_ref is not None)
