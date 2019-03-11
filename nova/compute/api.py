@@ -2504,8 +2504,6 @@ class API(base.Base):
 
         build_req_instances = objects.InstanceList(
             objects=[build_req.instance for build_req in build_requests])
-        # Only subtract from limit if it is not None
-        limit = (limit - len(build_req_instances)) if limit else limit
 
         # We could arguably avoid joining on security_groups if we're using
         # neutron (which is the default) but if you're using neutron then the
@@ -2528,6 +2526,8 @@ class API(base.Base):
 
             def _filter(instance):
                 if instance.uuid in seen_uuids:
+                    return False
+                if orig_limit and len(seen_uuids) >= orig_limit:
                     return False
                 seen_uuids.add(instance.uuid)
                 return True

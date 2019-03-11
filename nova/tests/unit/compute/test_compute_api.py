@@ -6128,10 +6128,9 @@ class Cellsv1DeprecatedTestMixIn(object):
             mock_inst_get.return_value = objects.InstanceList(
                 self.context, objects=build_req_instances[:1] + cell_instances)
 
-            self.assertRaises(exception.NovaException,
-                self.compute_api.get_all, self.context,
-                              search_opts={'foo': 'bar'},
-                limit=10, marker='fake-marker', sort_keys=['baz'],
+            instances = self.compute_api.get_all(
+                self.context, search_opts={'foo': 'bar'},
+                limit=None, marker='fake-marker', sort_keys=['baz'],
                 sort_dirs=['desc'])
 
             mock_buildreq_get.assert_called_once_with(
@@ -6141,6 +6140,15 @@ class Cellsv1DeprecatedTestMixIn(object):
             mock_inst_get.assert_called_once_with(
                 self.context, {'foo': 'bar'}, limit=None, marker=None,
                 fields=fields, sort_keys=['baz'], sort_dirs=['desc'])
+            for i, instance in enumerate(build_req_instances + cell_instances):
+                self.assertEqual(instance, instances[i])
+
+            instances = self.compute_api.get_all(
+                self.context, search_opts={'foo': 'bar'},
+                limit=3, marker='fake-marker', sort_keys=['baz'],
+                sort_dirs=['desc'])
+            self.assertEqual(len(instances), 3)
+
 
     @mock.patch.object(objects.BuildRequestList, 'get_by_filters')
     @mock.patch.object(objects.CellMapping, 'get_by_uuid',
@@ -6172,7 +6180,7 @@ class Cellsv1DeprecatedTestMixIn(object):
                 sort_keys=['baz'], sort_dirs=['desc'])
             fields = ['metadata', 'info_cache', 'security_groups']
             mock_inst_get.assert_called_once_with(
-                self.context, {'foo': 'bar'}, limit=8, marker=None,
+                self.context, {'foo': 'bar'}, limit=10, marker=None,
                 fields=fields, sort_keys=['baz'], sort_dirs=['desc'])
             for i, instance in enumerate(build_req_instances + cell_instances):
                 self.assertEqual(instance, instances[i])
@@ -6222,11 +6230,11 @@ class Cellsv1DeprecatedTestMixIn(object):
                     mock_target_cell.assert_any_call(self.context, cm)
             fields = ['metadata', 'info_cache', 'security_groups']
             inst_get_calls = [mock.call(cctxt, {'foo': 'bar'},
-                                        limit=8, marker=None,
+                                        limit=10, marker=None,
                                         fields=fields, sort_keys=['baz'],
                                         sort_dirs=['desc']),
                               mock.call(mock.ANY, {'foo': 'bar'},
-                                        limit=6, marker=None,
+                                        limit=8, marker=None,
                                         fields=fields, sort_keys=['baz'],
                                         sort_dirs=['desc'])
                               ]
