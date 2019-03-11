@@ -6149,7 +6149,6 @@ class Cellsv1DeprecatedTestMixIn(object):
                 sort_dirs=['desc'])
             self.assertEqual(len(instances), 3)
 
-
     @mock.patch.object(objects.BuildRequestList, 'get_by_filters')
     @mock.patch.object(objects.CellMapping, 'get_by_uuid',
                        side_effect=exception.CellMappingNotFound(uuid='fake'))
