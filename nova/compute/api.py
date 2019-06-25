@@ -2527,22 +2527,18 @@ class API(base.Base):
             def _filter(instance):
                 if instance.uuid in seen_uuids:
                     return False
-                if orig_limit and len(seen_uuids) >= orig_limit:
-                    return False
                 seen_uuids.add(instance.uuid)
                 return True
 
             return _filter
 
         filter_method = _get_unique_filter_method()
-        # Only subtract from limit if it is not None
-        limit = (limit - len(insts)) if limit else limit
         # TODO(alaski): Clean up the objects concatenation when List objects
         # support it natively.
         instances = objects.InstanceList(
             objects=list(filter(filter_method,
                            build_req_instances.objects +
-                           insts.objects)))
+                           insts.objects))[:orig_limit])
         if filter_ip:
             instances = self._ip_filter(instances, filters, orig_limit)
 
